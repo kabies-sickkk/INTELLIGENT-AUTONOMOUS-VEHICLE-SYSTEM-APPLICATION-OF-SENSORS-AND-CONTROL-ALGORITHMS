@@ -1,0 +1,225 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+// ===== L298N pins =====
+const int IN1 = 26;
+const int IN2 = 27;
+const int ENA = 25;
+
+const int IN3 = 12;
+const int IN4 = 13;
+const int ENB = 14;
+
+// ===== PWM config =====
+const int freq = 5000;
+const int ledChannelA = 0;
+const int ledChannelB = 1;
+const int resolution = 8; // 0..255
+
+// ===== WiFi config =====
+const char* WIFI_SSID     = "VanDatVjpPro";
+const char* WIFI_PASSWORD = "1502:333";
+
+// ===== MQTT (HiveMQ Cloud) config =====
+const char* mqtt_server    = "43bada278be7468bb212609d24e98ec7.s1.eu.hivemq.cloud";
+const int   mqtt_port      = 8883;
+const char* mqtt_user      = "VanDat";
+const char* mqtt_pass      = "RobotCar1";
+const char* mqtt_client_id = "esp32_iot_xe";
+const char* mqtt_topic_sub = "iot/esp32/cmd";
+const char* mqtt_topic_pub = "iot/esp32/status";
+
+// ===== MQTT objects =====
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+
+// ===== Robot control =====
+uint8_t speedA = 255;
+uint8_t speedB = 255;
+
+enum MoveCmd { STOP, FORWARD, BACKWARD, LEFT, RIGHT };
+volatile MoveCmd currentCmd = STOP;
+
+// ✅ prototype (quan trọng)
+void publishStatus(const char* msg);
+
+// ===== Status helper =====
+void publishStatus(const char* msg) {
+  Serial.println(msg);
+  if (mqtt.connected()) {
+    mqtt.publish(mqtt_topic_pub, msg, true); // retained: thấy trạng thái cuối
+  }
+}
+
+// ===== Motor control =====
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, 0);
+  ledcWrite(ledChannelB, 0);
+  publishStatus("Motors STOP");
+}
+
+void motorsForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors FORWARD");
+}
+
+void motorsBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors BACKWARD");
+}
+
+void motorsLeft() { // trái lùi, phải tiến
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors LEFT");
+}
+
+void motorsRight() { // trái tiến, phải lùi
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors RIGHT");
+}
+
+void applyCommand(MoveCmd cmd) {
+  switch (cmd) {
+    case FORWARD:  motorsForward();  break;
+    case BACKWARD: motorsBackward(); break;
+    case LEFT:     motorsLeft();     break;
+    case RIGHT:    motorsRight();    break;
+    default:       motorsStop();     break;
+  }
+}
+
+// ===== WiFi/MQTT helpers =====
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("Connecting WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - t0 > 20000) {
+      Serial.println("\nWiFi timeout -> retry");
+      WiFi.disconnect(true);
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      t0 = millis();
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  if (length == 0) return;
+  char c = (char)payload[0];
+
+  Serial.print("MQTT IN [");
+  Serial.print(topic);
+  Serial.print("] : ");
+  Serial.println(c);
+
+  MoveCmd next = STOP;
+  if (c == 'H' || c == 'h') next = FORWARD;
+  else if (c == 'B' || c == 'b') next = BACKWARD;
+  else if (c == 'L' || c == 'l') next = LEFT;
+  else if (c == 'R' || c == 'r') next = RIGHT;
+  else if (c == 'S' || c == 's') next = STOP;
+  else {
+    publishStatus("Unknown CMD (use H/B/L/R/S)");
+    return;
+  }
+
+  currentCmd = next;
+  applyCommand(currentCmd);
+}
+
+void connectMQTT() {
+  while (!mqtt.connected()) {
+    Serial.print("Connecting MQTT...");
+
+    const char* willTopic = mqtt_topic_pub;
+    const char* willMsg   = "offline";
+
+    bool ok = mqtt.connect(
+      mqtt_client_id,
+      mqtt_user,
+      mqtt_pass,
+      willTopic, 0, true, willMsg
+    );
+
+    if (ok) {
+      Serial.println("OK");
+      mqtt.publish(mqtt_topic_pub, "online", true);
+
+      if (mqtt.subscribe(mqtt_topic_sub)) {
+        Serial.print("Subscribed: ");
+        Serial.println(mqtt_topic_sub);
+      } else {
+        Serial.println("Subscribe FAIL");
+      }
+    } else {
+      Serial.print("FAILED, state=");
+      Serial.print(mqtt.state());
+      Serial.println(" -> retry in 2s");
+      delay(2000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  ledcSetup(ledChannelA, freq, resolution);
+  ledcAttachPin(ENA, ledChannelA);
+
+  ledcSetup(ledChannelB, freq, resolution);
+  ledcAttachPin(ENB, ledChannelB);
+
+  motorsStop();
+
+  connectWiFi();
+
+  secureClient.setInsecure();         // demo
+  secureClient.setHandshakeTimeout(30);
+
+  mqtt.setServer(mqtt_server, mqtt_port);
+  mqtt.setCallback(onMqttMessage);
+
+  connectMQTT();
+
+  Serial.println("RobotCar MQTT control ready!");
+  Serial.println("Send to topic iot/esp32/cmd: H/B/L/R (S=stop)");
+}
+
+void loop() {
+  connectWiFi();
+  if (!mqtt.connected()) connectMQTT();
+  mqtt.loop();
+}

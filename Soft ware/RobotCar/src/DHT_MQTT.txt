@@ -1,0 +1,164 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <DHT.h>
+
+// ===== WiFi config =====
+const char* WIFI_SSID     = "VanDatVjpPro";
+const char* WIFI_PASSWORD = "1502:333";
+
+// ===== MQTT (HiveMQ Cloud) config =====
+const char* mqtt_server    = "43bada278be7468bb212609d24e98ec7.s1.eu.hivemq.cloud";
+const int   mqtt_port      = 8883;                 // TLS port
+const char* mqtt_user      = "VanDat";
+const char* mqtt_pass      = "RobotCar1";
+const char* mqtt_client_id = "esp32_iot_xe";       // phải UNIQUE
+const char* mqtt_topic_pub = "iot/esp32/sensor";   // ESP32 publish DHT
+const char* mqtt_topic_sub = "iot/esp32/cmd";      // ESP32 subscribe nhận lệnh
+
+// ===== DHT11 config =====
+#define DHTPIN 16
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// ===== MQTT objects =====
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+
+// ===== MQTT callback =====
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  Serial.print("MQTT IN [");
+  Serial.print(topic);
+  Serial.print("] : ");
+
+  for (unsigned int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+  Serial.println();
+}
+
+// ===== Connect WiFi =====
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("Connecting WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    // timeout 20s cho khỏi treo
+    if (millis() - t0 > 20000) {
+      Serial.println("\nWiFi connect timeout -> retry");
+      WiFi.disconnect(true);
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      t0 = millis();
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ===== Connect MQTT =====
+void connectMQTT() {
+  while (!mqtt.connected()) {
+    Serial.print("Connecting MQTT...");
+
+    // LWT (optional) để debug
+    const char* willTopic = "iot/esp32/status";
+    const char* willMsg   = "offline";
+
+    bool ok = mqtt.connect(
+      mqtt_client_id,
+      mqtt_user,
+      mqtt_pass,
+      willTopic, 0, true, willMsg
+    );
+
+    if (ok) {
+      Serial.println("OK");
+      mqtt.publish(willTopic, "online", true);
+
+      // Subscribe nhận lệnh
+      if (mqtt.subscribe(mqtt_topic_sub)) {
+        Serial.print("Subscribed: ");
+        Serial.println(mqtt_topic_sub);
+      } else {
+        Serial.println("Subscribe FAIL");
+      }
+    } else {
+      Serial.print("FAILED, state=");
+      Serial.print(mqtt.state());
+      Serial.println(" -> retry in 2s");
+      delay(2000);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  dht.begin();
+
+  connectWiFi();
+
+  // TLS quick mode (demo): không verify cert
+  secureClient.setInsecure();
+  secureClient.setHandshakeTimeout(30);
+
+  mqtt.setServer(mqtt_server, mqtt_port);
+  mqtt.setCallback(onMqttMessage);
+
+  connectMQTT();
+
+  Serial.println("DHT11 + MQTT started!");
+  Serial.print("PUB topic: ");
+  Serial.println(mqtt_topic_pub);
+  Serial.print("SUB topic: ");
+  Serial.println(mqtt_topic_sub);
+}
+
+void loop() {
+  connectWiFi();
+
+  if (!mqtt.connected()) {
+    connectMQTT();
+  }
+  mqtt.loop();
+
+  // Publish DHT mỗi 2 giây
+  static unsigned long lastSend = 0;
+  if (millis() - lastSend >= 2000) {
+    lastSend = millis();
+
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    if (isnan(h) || isnan(t)) {
+      Serial.println("Failed to read from DHT11!");
+      return;
+    }
+
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "{\"temp\":%.2f,\"humi\":%.2f}", t, h);
+
+    bool ok = mqtt.publish(mqtt_topic_pub, payload);
+
+    Serial.print("Publish ");
+    Serial.print(mqtt_topic_pub);
+    Serial.print(": ");
+    Serial.print(payload);
+    Serial.print(" -> ");
+    Serial.println(ok ? "OK" : "FAIL");
+  }
+}

@@ -1,0 +1,468 @@
+/************************************************************
+ * ESP32 + AWS IoT Core + Node-RED
+ * Robot Car (L298N + Encoder) + LED Control
+ ************************************************************/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <time.h>
+
+// ================= WIFI =================
+const char* ssid = "Phong Tro";
+const char* password = "a123456a";
+
+/* ================= AWS IOT ================= */
+const char* AWS_ENDPOINT = "a3bfjjwy5d1vo8-ats.iot.us-east-1.amazonaws.com";
+#define AWS_PORT 8883
+#define CLIENT_ID "esp32_robot_full"
+
+/* ================= MQTT TOPICS ================= */
+#define TOPIC_CMD        "iot/esp32/cmd"
+#define TOPIC_STATUS     "iot/esp32/status"
+#define TOPIC_ENC_A      "iot/esp32/encA"
+#define TOPIC_ENC_B      "iot/esp32/encB"
+#define TOPIC_LED_CMD    "iot/esp32/led/cmd"
+#define TOPIC_LED_STATUS "iot/esp32/led/status"
+
+/* ================= LED ================= */
+#define LED_PIN 25
+
+/* ================= MOTOR (L298N) ================= */
+const int IN1 = 26;
+const int IN2 = 27;
+const int ENA_PIN = 4;
+
+const int IN3 = 12;
+const int IN4 = 13;
+const int ENB_PIN = 14;
+
+/* ================= ENCODER ================= */
+#define ENCL_C1 18
+#define ENCL_C2 19
+#define ENCR_C1 32
+#define ENCR_C2 33
+
+volatile long encoderLeftCount = 0;
+volatile long encoderRightCount = 0;
+
+volatile long lastDL = 0, lastDR = 0;
+volatile float lastRpmL = 0, lastRpmR = 0;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+const float PPR_EFF = 40.0f;
+
+/* ================= PWM ================= */
+const int freq = 5000;
+const int resolution = 8;
+const int ledChannelA = 0;
+const int ledChannelB = 1;
+
+uint8_t speedA = 255;
+uint8_t speedB = 255;
+
+/* ================= CERT ================= */
+const char AWS_ROOT_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+)EOF";
+
+const char AWS_CLIENT_CERT[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDWTCCAkGgAwIBAgIURsrSPKENW7v9OK7WcjYbfclb9NAwDQYJKoZIhvcNAQEL
+BQAwTTFLMEkGA1UECwxCQW1hem9uIFdlYiBTZXJ2aWNlcyBPPUFtYXpvbi5jb20g
+SW5jLiBMPVNlYXR0bGUgU1Q9V2FzaGluZ3RvbiBDPVVTMB4XDTI2MDEwNDE5NDA0
+MloXDTQ5MTIzMTIzNTk1OVowHjEcMBoGA1UEAwwTQVdTIElvVCBDZXJ0aWZpY2F0
+ZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKBmgQSm8bq67ewoIc13
+ra50vwLRdLzZUdig/wNysq/oop63zsPTlolBBN3/4isKpU4nWcmiw/pmBA8LPQVq
+CP9e0MP1ArniEMjzdfGRdCGOWhA+Enw31tl+OpoYrxu6ZVZb83GDMx8A+6ZoHlHO
+xWCOdOTv16576kLV3sOtJh363yJnvnmzNoAS3Ntm+x/EzDHbZN/vg/i7EGnTBRpn
+RkVvaihxseun2cM1GgWGqrXXuM89MdUTaf0/RqnOYR+b2SghhyFcaWzJwVG4Iv5O
+z5I4CDpZiV2VxPOkZxkKb9W0kYokEHTrBuQaK0wJDctPkRogQ2sTz6UJJZc+NQMj
+khECAwEAAaNgMF4wHwYDVR0jBBgwFoAUfNYre7zh5bqEyfLgqKa7GRa41j0wHQYD
+VR0OBBYEFA8mQI5Y1x2/wWqazGukFI5NpGD+MAwGA1UdEwEB/wQCMAAwDgYDVR0P
+AQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4IBAQBidIV+OKTIYEqn0dHXI8WoPcbY
+YaVOt8xpZCaQYqlF1SJxP3CVSymAmXG7UUuZXUfqNy68EmhaaYh3Er4Pp6arDOAa
+uBagLLokSsdnP7OcQrmVRvjTkPXjTaB/U34rlvaAMTRfHvKsMk6Uu9zeq2A4Jzdt
+x5Q9mZ1t8oMRif23o3wMuup1sINCsijn6tSPjRftUgPQtDD5dtDb40p/QN1GCJPG
+O9tte1W/1QBrjjJglYXIuVOjyxKHmXVmRvlDIcujWw4O/bIRLHT1NjftJdvOlNkg
+ypWqLUTLLqz6c7z0TOsaoWA4CtHZSM1/GmCJS9Jqv8psXWqB6NgoHyypsCEf
+-----END CERTIFICATE-----
+
+
+
+)EOF";
+
+const char AWS_PRIVATE_KEY[] PROGMEM = R"EOF(
+-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAoGaBBKbxurrt7CghzXetrnS/AtF0vNlR2KD/A3Kyr+iinrfO
+w9OWiUEE3f/iKwqlTidZyaLD+mYEDws9BWoI/17Qw/UCueIQyPN18ZF0IY5aED4S
+fDfW2X46mhivG7plVlvzcYMzHwD7pmgeUc7FYI505O/XrnvqQtXew60mHfrfIme+
+ebM2gBLc22b7H8TMMdtk3++D+LsQadMFGmdGRW9qKHGx66fZwzUaBYaqtde4zz0x
+1RNp/T9Gqc5hH5vZKCGHIVxpbMnBUbgi/k7PkjgIOlmJXZXE86RnGQpv1bSRiiQQ
+dOsG5BorTAkNy0+RGiBDaxPPpQkllz41AyOSEQIDAQABAoIBAAbYeRcmvNhYVAEp
+MVAglHQGnYRURiQtLjYNoPSXt5KUXiRh+dwXsqwG71s+KXvmx2lPeqCFZtHP+spd
+k2wgu2OSu1wxn70pLcg1w8nciFVKSwO4cneEtpGvtnaPKSII0XxfDkPA8rSXCSZv
++SNKrNfTHKAMsGrM9RGHKSu2vxK2afROT5lLwfsOOV4U02niHozL/DCJk1nUZknM
+3CnJxirqsEeJTDi2wW1dCTJMRfYgbkuwzmGAaFfakst7HrhyOSxIyCXGbNqaeq3o
+7zq0xrcLkkjlsreYJ4PpL1IOnghe3fxlX27Zzx3KiawWxrUFqwgBSXtjZ4nMNp/i
+wdUQx1UCgYEAz3TVG/Dimz5NTsYNtYRF+9Jdkm6jFHIg+SuU/RgWcxLhd6VFqC/A
+AC7S0EjRw5B0XYaXjAYfDLZc82FWctmAsHCGj5Q2LN0JulHsFyFL/8qWd88XatVg
++Y8ytDaJ0BABoPOhmb+tiauUT7MmK2ru+ajCXeUv9GR12xQS0RQBgN8CgYEAxe7m
+Bj4wIozldYa7hrWfinRPgsQ+Ql22XJofGT+Ngt2KFdIyvdt8BMTxM46gMbQiPhNe
+hmL49HR408gQfLqf6FPYbvFRkAf8UUiBKjEILFRfc6L/46dWSIDYR2kNYkR4+IbT
+Y471vDpLJZW7usOOzsE9iwhq3W4tqGjdzTS6mw8CgYEAjkKSxOdJraVqhANCcV/0
+UbwvGHQv9pxQyi09rNUwx9aBsHcwLiYYZse1Hslgtte/REdAcu/bqO8BDJCKJJXM
+LrHrRFghUmB9BDybRj06DX1R83SanVMXferZnUTs+jWPuFx5S6JqkUaMnJ7AJPPe
+TmuQZaz9VnzxaLr6ME+kvEcCgYBBTV5KtP3AiGez7K219foa/eC1rfU0hCKETrzv
+4Y3YnSrPpDfld6JlGGzTq7yiaWHaxR0sjT7BuCOdC6aU4CWdyvvfLnLQaDIQxzEG
+MIMXzQZo6mAuRakr5oZ0mO43e4vFwwW/FQ1x+nGMhugW6CoXgJ3DXxWS1KTvqRl0
+eG8QdQKBgC3paUXXgd0XI6w+Y7ooYnj7snwAFg5OkBTRSlcVE/2AqtKlL0RZJYyR
+GDh2sp0MVLD9eoURfF0DYOy24wE0e7XDFYkdkZHzGAabDD/U1BEPqXQfAgeYDsj6
+aICqwMGporjqhiivCOXm+X1N2trQrJn++xxZA+MVC02LN5OsCMQi
+-----END RSA PRIVATE KEY-----
+
+)EOF";
+
+/* ================= OBJECT ================= */
+WiFiClientSecure net;
+PubSubClient mqtt(net);
+
+// human-readable MQTT client state
+const char* mqttStateToString(int state) {
+  switch (state) {
+    case -4: return "MQTT_CONNECTION_TIMEOUT";
+    case -3: return "MQTT_CONNECTION_LOST";
+    case -2: return "MQTT_CONNECT_FAILED";
+    case -1: return "MQTT_CONNECTION_ERROR";
+    case 0: return "MQTT_CONNECTED";
+    case 1: return "MQTT_CONNECT_BAD_PROTOCOL";
+    case 2: return "MQTT_CONNECT_BAD_CLIENT_ID";
+    case 3: return "MQTT_CONNECT_UNAVAILABLE";
+    case 4: return "MQTT_CONNECT_BAD_CREDENTIALS";
+    case 5: return "MQTT_CONNECT_UNAUTHORIZED";
+    default: return "MQTT_UNKNOWN_STATE";
+  }
+}
+
+/* ================= ROBOT STATE ================= */
+enum MoveCmd { STOP, FORWARD, BACKWARD, LEFT, RIGHT };
+volatile MoveCmd currentCmd = STOP;
+
+volatile bool streamEncA = false;
+volatile bool streamEncB = false;
+const uint32_t ENC_PUB_MS = 200;
+
+// Non-blocking connection management
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_RETRY_MS = 5000;
+bool timeConfigured = false;
+unsigned long lastMqttAttempt = 0;
+const unsigned long MQTT_RETRY_MS = 3000;
+bool wifiWasConnected = false;
+bool mqttWasConnected = false;
+/* ================= INTERRUPTS ================= */
+void IRAM_ATTR encoderLeftISR() {
+  int a = digitalRead(ENCL_C1);
+  int b = digitalRead(ENCL_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderLeftCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR encoderRightISR() {
+  int a = digitalRead(ENCR_C1);
+  int b = digitalRead(ENCR_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderRightCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+/* ================= MOTOR ================= */
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, 0);
+  ledcWrite(ledChannelB, 0);
+}
+
+void motorsForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+}
+
+void motorsBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+}
+
+void motorsLeft() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void motorsRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void applyCommand(MoveCmd cmd) {
+  switch (cmd) {
+    case FORWARD: motorsForward(); break;
+    case BACKWARD: motorsBackward(); break;
+    case LEFT: motorsLeft(); break;
+    case RIGHT: motorsRight(); break;
+    default: motorsStop(); break;
+  }
+}
+
+/* ================= MQTT CALLBACK ================= */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (uint32_t i = 0; i < length; i++) msg += (char)payload[i];
+
+  Serial.print("[MQTT RX] Topic="); Serial.print(topic);
+  Serial.print(" Len="); Serial.println(length);
+  Serial.print("[MQTT RX] Payload= "); Serial.println(msg);
+
+  /* LED */
+  if (String(topic) == TOPIC_LED_CMD) {
+    if (msg == "ON") {
+      digitalWrite(LED_PIN, HIGH);
+      mqtt.publish(TOPIC_LED_STATUS, "ON");
+      Serial.println("[LED] Set ON");
+    } else if (msg == "OFF") {
+      digitalWrite(LED_PIN, LOW);
+      mqtt.publish(TOPIC_LED_STATUS, "OFF");
+      Serial.println("[LED] Set OFF");
+    }
+    return;
+  }
+
+  /* Robot */
+  if (msg == "ENA") streamEncA = true;
+  else if (msg == "ENAS") streamEncA = false;
+  else if (msg == "ENB") streamEncB = true;
+  else if (msg == "ENBS") streamEncB = false;
+  else {
+    char c = msg[0];
+    if (c == 'H') currentCmd = FORWARD;
+    else if (c == 'B') currentCmd = BACKWARD;
+    else if (c == 'L') currentCmd = LEFT;
+    else if (c == 'R') currentCmd = RIGHT;
+    else currentCmd = STOP;
+    applyCommand(currentCmd);
+    Serial.print("[ROBOT] Command applied: ");
+    switch (currentCmd) {
+      case FORWARD: Serial.println("FORWARD"); break;
+      case BACKWARD: Serial.println("BACKWARD"); break;
+      case LEFT: Serial.println("LEFT"); break;
+      case RIGHT: Serial.println("RIGHT"); break;
+      default: Serial.println("STOP"); break;
+    }
+  }
+}
+
+/* ================= AWS CONNECT ================= */
+void connectAWS() {
+  // Don't attempt if already connected
+  if (mqtt.connected()) return;
+
+  // Require WiFi before trying MQTT/TLS
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[AWS] WiFi not connected, skipping connect");
+    return;
+  }
+
+  // Require valid system time for TLS cert validation
+  time_t now = time(nullptr);
+  // 1609459200 = 2021-01-01 00:00:00 UTC as a safe threshold
+  if (now < 1609459200) {
+    Serial.println("[AWS] Time not synced yet, waiting for NTP before TLS connect...");
+    return;
+  }
+
+  if (millis() - lastMqttAttempt < MQTT_RETRY_MS) return;
+  lastMqttAttempt = millis();
+
+  static int attempt = 0;
+  attempt++;
+  Serial.print("[AWS] Attempt #"); Serial.print(attempt);
+  Serial.println(" connecting to AWS IoT...");
+
+  if (mqtt.connect(CLIENT_ID)) {
+    Serial.println("[AWS] MQTT connected");
+    mqtt.subscribe(TOPIC_CMD);
+    mqtt.subscribe(TOPIC_LED_CMD);
+    mqtt.publish(TOPIC_STATUS, "ONLINE", true);
+    Serial.println("[AWS] Subscribed to topics and published ONLINE status");
+    mqttWasConnected = true;
+  } else {
+    int st = mqtt.state();
+    Serial.print("[AWS] Connect failed, state="); Serial.print(st);
+    Serial.print(" (" ); Serial.print(mqttStateToString(st)); Serial.println(")");
+    Serial.print("[AWS] net.connected="); Serial.println(net.connected());
+  }
+}
+
+/* ================= ENCODER TASK ================= */
+void encoderTask() {
+  static uint32_t t = 0;
+  if (millis() - t < ENC_PUB_MS) return;
+  t = millis();
+
+  long dL, dR;
+  portENTER_CRITICAL(&mux);
+  dL = encoderLeftCount; encoderLeftCount = 0;
+  dR = encoderRightCount; encoderRightCount = 0;
+  portEXIT_CRITICAL(&mux);
+
+  float rpmL = (dL / PPR_EFF) * 600.0;
+  float rpmR = (dR / PPR_EFF) * 600.0;
+
+  if (streamEncA) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"d\":%ld,\"rpm\":%.2f}", dL, rpmL);
+    mqtt.publish(TOPIC_ENC_A, buf);
+  }
+
+  if (streamEncB) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"d\":%ld,\"rpm\":%.2f}", dR, rpmR);
+    mqtt.publish(TOPIC_ENC_B, buf);
+  }
+}
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(ENCL_C1, INPUT_PULLUP);
+  pinMode(ENCL_C2, INPUT_PULLUP);
+  pinMode(ENCR_C1, INPUT_PULLUP);
+  pinMode(ENCR_C2, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENCL_C1), encoderLeftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCR_C1), encoderRightISR, CHANGE);
+
+  ledcSetup(ledChannelA, freq, resolution);
+  ledcAttachPin(ENA_PIN, ledChannelA);
+  ledcSetup(ledChannelB, freq, resolution);
+  ledcAttachPin(ENB_PIN, ledChannelB);
+
+  // Configure WiFi in station mode and start connecting (non-blocking)
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname("esp32_robot");
+  Serial.println("WiFi: start connecting...");
+  WiFi.begin(ssid, password);
+
+  // show immediate status
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected, IP="); Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("WiFi status: "); Serial.println(WiFi.status());
+  }
+
+  net.setCACert(AWS_ROOT_CA);
+  net.setCertificate(AWS_CLIENT_CERT);
+  net.setPrivateKey(AWS_PRIVATE_KEY);
+
+  mqtt.setServer(AWS_ENDPOINT, AWS_PORT);
+  mqtt.setCallback(mqttCallback);
+
+  // try connecting to AWS once (non-blocking retries happen in loop)
+  // connectAWS() will be attempted from loop() after WiFi/time are ready
+}
+
+// heartbeat timer globals (file-scope)
+unsigned long lastHeartbeat = 0;
+const unsigned long HEARTBEAT_MS = 10000;
+
+/* ================= LOOP ================= */
+void loop() {
+  // WiFi: start reconnect attempts at intervals (non-blocking)
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWiFiAttempt > WIFI_RETRY_MS) {
+      lastWiFiAttempt = millis();
+      Serial.println("WiFi: retrying connect...");
+      WiFi.begin(ssid, password);
+    }
+    wifiWasConnected = false;
+  } else {
+    if (!wifiWasConnected) {
+      Serial.print("WiFi connected, IP="); Serial.println(WiFi.localIP());
+      wifiWasConnected = true;
+    }
+    if (!timeConfigured) {
+      configTime(7 * 3600, 0, "pool.ntp.org");
+      timeConfigured = true;
+      Serial.println("[TIME] NTP request sent (waiting for sync)...");
+    }
+  }
+
+  // MQTT: attempt non-blocking connect when possible
+  if (!mqtt.connected()) connectAWS();
+  mqtt.loop();
+
+  // Track MQTT connection transitions and log disconnect reasons
+  if (!mqtt.connected()) {
+    if (mqttWasConnected) {
+      int st = mqtt.state();
+      Serial.print("[AWS] MQTT disconnected, state="); Serial.print(st);
+      Serial.print(" ("); Serial.print(mqttStateToString(st)); Serial.println(")");
+      mqttWasConnected = false;
+    }
+  } else {
+    if (!mqttWasConnected) {
+      Serial.println("[AWS] MQTT connected (loop detected)");
+      mqttWasConnected = true;
+    }
+  }
+
+  encoderTask();
+
+  // periodic heartbeat: RSSI, free heap and current time
+  if (millis() - lastHeartbeat > HEARTBEAT_MS) {
+    lastHeartbeat = millis();
+    Serial.print("[HB] RSSI="); Serial.print(WiFi.RSSI()); Serial.print(" dBm");
+    Serial.print(", FreeHeap="); Serial.print(ESP.getFreeHeap());
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    if (localtime_r(&now, &timeinfo)) {
+      char tbuf[64];
+      strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      Serial.print(", Time="); Serial.print(tbuf);
+    } else {
+      Serial.print(", Time=not-synced");
+    }
+    Serial.println();
+  }
+}

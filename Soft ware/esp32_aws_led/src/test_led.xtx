@@ -1,0 +1,194 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <time.h>
+
+// ================= WIFI =================
+const char* ssid = "ChanHuy";
+const char* password = "12345671";
+
+// ================= AWS =================
+const char* aws_endpoint = "a3bfjjwy5d1vo8-ats.iot.us-east-1.amazonaws.com";
+#define AWS_PORT 8883
+#define CLIENT_ID "esp32_led"
+
+// ================= MQTT =================
+#define LED_PIN 4
+#define SUB_TOPIC "esp32/led/cmd"
+#define PUB_TOPIC "esp32/led/status"
+
+// ================= CERT =================
+const char* ca_cert = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+)EOF";
+
+const char* client_cert = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDWTCCAkGgAwIBAgIUef0Kh5zK7bZrs9v42Pf7fXmwnbAwDQYJKoZIhvcNAQEL
+BQAwTTFLMEkGA1UECwxCQW1hem9uIFdlYiBTZXJ2aWNlcyBPPUFtYXpvbi5jb20g
+SW5jLiBMPVNlYXR0bGUgU1Q9V2FzaGluZ3RvbiBDPVVTMB4XDTI2MDEwNDA2MzMw
+NVoXDTQ5MTIzMTIzNTk1OVowHjEcMBoGA1UEAwwTQVdTIElvVCBDZXJ0aWZpY2F0
+ZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALrDgi1R+lb0CVZP/sAA
+NNm3eXMDCaFq1hVTaQ4sXd8lhFbKZuBCZLzUdO+uNvvgEXnUX+KlJRF4Aktpq6lf
+nYx/4wqdATZpFDX9jvQLxZbIplQRTLkSlit2NW2P08y+PW+Y/vV4+WjxeFfm6/kl
+uDa6LJe4HQaVoDeC9bWtdzd6057KYiJa4fyjBT6ECBSvdF85bAx6EnmEfqQ0WL1l
+rL7YNphWHkNvCrDlICqcvxlohDUp2/D2x5ocbtuvFJKbBT9uFn0fPbxMD3bE2Ll/
+HMlk1OCaVBNq52wc3rIhQ6sNMRg4NChGUE0ZCnYoBnoxfuHIHBvEWsr1ELTW9F9G
+XL0CAwEAAaNgMF4wHwYDVR0jBBgwFoAURETun8d/OrVtTXHGxLBTd1d2Y2IwHQYD
+VR0OBBYEFNRBiEYxaZsP+3BjybOF06olVq2mMAwGA1UdEwEB/wQCMAAwDgYDVR0P
+AQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4IBAQCdhiIwzV3zDDHP3QfphnW8IFH4
+FDBpu6AsSX6FvcSs4x0QOPA/k+V6JC2zOHNZxD+gErpd/U0KSd0uw8AQJMNv+pC8
+XmOF9Gy4wI7Pq5VJFmn3Y0j9lPHjN9IsDA2YLl02bVLIAsKrigqXTB+DXwTTa9x9
+bmw4gf8HVUmf/znokpgb/wgyJ/bajwaHSWUfI8yozXoxFEI1fRkEMcreGJ41zIJ6
+1PdVFIzgyHOumt6vUWICSWnF0U+9c6PAi/BKmBqqCV1zVBa8CejIwdNvc2UJnnfl
+XyuKiLPyduTrDmmIafJBDU/nFFx4zjew9pL5kbNMjozAV2HlHyxOtzkPQIYi
+-----END CERTIFICATE-----
+
+)EOF";
+
+const char* private_key = R"EOF(
+-----BEGIN RSA PRIVATE KEY-----
+MIIEogIBAAKCAQEAusOCLVH6VvQJVk/+wAA02bd5cwMJoWrWFVNpDixd3yWEVspm
+4EJkvNR07642++ARedRf4qUlEXgCS2mrqV+djH/jCp0BNmkUNf2O9AvFlsimVBFM
+uRKWK3Y1bY/TzL49b5j+9Xj5aPF4V+br+SW4Nrosl7gdBpWgN4L1ta13N3rTnspi
+Ilrh/KMFPoQIFK90XzlsDHoSeYR+pDRYvWWsvtg2mFYeQ28KsOUgKpy/GWiENSnb
+8PbHmhxu268UkpsFP24WfR89vEwPdsTYuX8cyWTU4JpUE2rnbBzesiFDqw0xGDg0
+KEZQTRkKdigGejF+4cgcG8RayvUQtNb0X0ZcvQIDAQABAoIBAGuIQh2iA8eo/u9J
+Y95cwBFTCIRmDVd5UgY5XlWgyfO/gDEQnKcm0yW+Fg4ietoPK0DAPO0cNPmX5YpS
+L1p4CRhqUek8eQRBADgN5A8z7/JfWRUyWMB+qSQhDaYll8ddCbaFmtbvbnsz/Rxv
+gxKS2zv3edFpWpz97Z/IsXyHggrYm6WvOowKdbn5SYZCm2qiMwAMW4FNOTgthdsr
+Q5uSDTSpkgXXqkXsYrqnPil0vSjj3R487XW06VW5/yuTh7getuq2oVGoEkNes/5z
+XGvmqHhf3t3P7QSt8rzF88uigX8j43I/hwlR5cNmiORmOM90SfM1fPnTA+IY/QzU
+hsNf64ECgYEA4rucUMFQmNxiOUzbL3FjqSjKzU62bYczZYF/afXyoyM5WNlehcVu
+vlpnrnj/R+vLgK6RuIvje6lV5eT9ZFTVlKimQnkHyAdZqYq7Jrm0+g3CK9yT2JAA
+fOhVLJimr31LKuFCEDn3Ot5Kjr4+QrEt1q4ons9PW3WnNbw9gqEgDPECgYEA0t8d
+8l21gp0NAirdOTYSKBalJFquT5OaO6nC/A6iBULV5WOciRutmzgRuwOeNSfTfe2R
+Cz0BLOeYFVkTYzpZWEOmAFRM1ucobtCzjjXFoNw5mmsBkKK5wYoOw7bmgoc/VyoX
+fzqLf2UyrByLXAAtUR8R/oEQE13Yshp/LZoC/I0CgYAEBSOOYv8U1sN/FJfGTZJg
+y3JdFYoygvUsVZF2xX+Z2OQJaUE9yfRet6ei9k5AbjPbgjzfMsvDw4rcWqULhF2N
+FzhrcU3sBAVY9ja/Rweob1oEARM2Acegb1YjRkmeTvBoQDo1o3F4v7w+r6zW7eFM
+LyZVOoPDsWBXmZDVohm5YQKBgE0z9sjXWi75xNt4Sgo6K6eVstx+frcPuTYCzypt
+SRBYCeuz7omcIpFjk8o+ZtvbOukt4x6UNSv1lo6qUBjSMgfIrKwOMRu1Ae6gZjy4
+nyRnvIc2ihokGZIsM3+gJQDA94W4GWYxTwVTTZwJz1PdlLnQgEwHgJU2lLGQVeOi
+MVm5AoGAXxCD88KPfTIAddoyVJ3byQAoddnZ5n2ewy8kcqA4IBEK5FONYveEHb3U
+K82u2AGbzOGPxG9S3J1SjvTpay677IQdgkJcO2VXbOWXgH7mb38xBHkoVi2HeMZI
+6yw0fRH0BpmHPA9ftdh31LQDahLU3ODmNtKkr4LaxhMl8s7Ie78=
+-----END RSA PRIVATE KEY-----
+
+)EOF";
+
+// ================= OBJECT =================
+WiFiClientSecure net;
+PubSubClient client(net);
+
+// ================= TIME =================
+void setupTime() {
+  Serial.println("[TIME] Syncing time with NTP...");
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+
+  time_t now = time(nullptr);
+  while (now < 100000) {
+    Serial.print(".");
+    delay(500);
+    now = time(nullptr);
+  }
+  Serial.println("\n[TIME] Time synced successfully");
+}
+
+// ================= MQTT CALLBACK =================
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  Serial.print("[MQTT] Message received: ");
+  Serial.println(msg);
+
+  if (msg == "ON") {
+    digitalWrite(LED_PIN, HIGH);
+    client.publish(PUB_TOPIC, "ON");
+  } else if (msg == "OFF") {
+    digitalWrite(LED_PIN, LOW);
+    client.publish(PUB_TOPIC, "OFF");
+  }
+}
+
+// ================= CONNECT AWS =================
+void connectAWS() {
+  while (!client.connected()) {
+    Serial.print("[AWS] Connecting to AWS IoT...");
+    if (client.connect(CLIENT_ID)) {
+      Serial.println(" SUCCESS");
+      client.subscribe(SUB_TOPIC);
+      Serial.println("[AWS] Subscribed to topic");
+      client.publish(PUB_TOPIC, "ESP32 Connected");
+    } else {
+      Serial.print(" FAILED, rc=");
+      Serial.print(client.state());
+      Serial.println(" retry in 2s");
+      delay(2000);
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  pinMode(LED_PIN, OUTPUT);
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n[SYS] ESP32 Booting...");
+
+  // WiFi
+  Serial.print("[WiFi] Connecting");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\n[WiFi] Connected successfully");
+  Serial.print("[WiFi] IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Time (BẮT BUỘC)
+  setupTime();
+
+  // TLS
+  net.setCACert(ca_cert);
+  net.setCertificate(client_cert);
+  net.setPrivateKey(private_key);
+
+  // MQTT
+  client.setServer(aws_endpoint, AWS_PORT);
+  client.setCallback(callback);
+
+  connectAWS();
+}
+
+// ================= LOOP =================
+void loop() {
+  if (!client.connected()) {
+    connectAWS();
+  }
+  client.loop();
+}

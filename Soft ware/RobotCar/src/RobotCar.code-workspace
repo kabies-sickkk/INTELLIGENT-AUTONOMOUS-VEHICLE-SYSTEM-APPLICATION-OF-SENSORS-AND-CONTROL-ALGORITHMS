@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": ".."
+		},
+		{
+			"name": "esp32_aws_led",
+			"path": "../../../Documents/PlatformIO/Projects/esp32_aws_led"
+		}
+	],
+	"settings": {}
+}

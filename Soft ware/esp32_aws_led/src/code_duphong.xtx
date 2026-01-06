@@ -1,0 +1,370 @@
+/************************************************************
+ * ESP32 + AWS IoT Core + Node-RED
+ * Robot Car (L298N + Encoder) + LED Control
+ ************************************************************/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <time.h>
+
+// ================= WIFI =================
+const char* ssid = "Phong Tro";
+const char* password = "a123456a";
+
+/* ================= AWS IOT ================= */
+const char* AWS_ENDPOINT = "a3bfjjwy5d1vo8-ats.iot.us-east-1.amazonaws.com";
+#define AWS_PORT 8883
+#define CLIENT_ID "esp32_robot_full"
+
+/* ================= MQTT TOPICS ================= */
+#define TOPIC_CMD        "iot/esp32/cmd"
+#define TOPIC_STATUS     "iot/esp32/status"
+#define TOPIC_ENC_A      "iot/esp32/encA"
+#define TOPIC_ENC_B      "iot/esp32/encB"
+#define TOPIC_LED_CMD    "iot/esp32/led/cmd"
+#define TOPIC_LED_STATUS "iot/esp32/led/status"
+
+/* ================= LED ================= */
+#define LED_PIN 4
+
+/* ================= MOTOR (L298N) ================= */
+const int IN1 = 26;
+const int IN2 = 27;
+const int ENA_PIN = 25;
+
+const int IN3 = 12;
+const int IN4 = 13;
+const int ENB_PIN = 14;
+
+/* ================= ENCODER ================= */
+#define ENCL_C1 18
+#define ENCL_C2 19
+#define ENCR_C1 32
+#define ENCR_C2 33
+
+volatile long encoderLeftCount = 0;
+volatile long encoderRightCount = 0;
+
+volatile long lastDL = 0, lastDR = 0;
+volatile float lastRpmL = 0, lastRpmR = 0;
+
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+const float PPR_EFF = 40.0f;
+
+/* ================= PWM ================= */
+const int freq = 5000;
+const int resolution = 8;
+const int ledChannelA = 0;
+const int ledChannelB = 1;
+
+uint8_t speedA = 255;
+uint8_t speedB = 255;
+
+/* ================= CERT ================= */
+const char AWS_ROOT_CA[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDQTCCAimgAwIBAgITBmyfz5m/jAo54vB4ikPmljZbyjANBgkqhkiG9w0BAQsF
+ADA5MQswCQYDVQQGEwJVUzEPMA0GA1UEChMGQW1hem9uMRkwFwYDVQQDExBBbWF6
+b24gUm9vdCBDQSAxMB4XDTE1MDUyNjAwMDAwMFoXDTM4MDExNzAwMDAwMFowOTEL
+MAkGA1UEBhMCVVMxDzANBgNVBAoTBkFtYXpvbjEZMBcGA1UEAxMQQW1hem9uIFJv
+b3QgQ0EgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALJ4gHHKeNXj
+ca9HgFB0fW7Y14h29Jlo91ghYPl0hAEvrAIthtOgQ3pOsqTQNroBvo3bSMgHFzZM
+9O6II8c+6zf1tRn4SWiw3te5djgdYZ6k/oI2peVKVuRF4fn9tBb6dNqcmzU5L/qw
+IFAGbHrQgLKm+a/sRxmPUDgH3KKHOVj4utWp+UhnMJbulHheb4mjUcAwhmahRWa6
+VOujw5H5SNz/0egwLX0tdHA114gk957EWW67c4cX8jJGKLhD+rcdqsq08p8kDi1L
+93FcXmn/6pUCyziKrlA4b9v7LWIbxcceVOF34GfID5yHI9Y/QCB/IIDEgEw+OyQm
+jgSubJrIqg0CAwEAAaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+AYYwHQYDVR0OBBYEFIQYzIU07LwMlJQuCFmcx7IQTgoIMA0GCSqGSIb3DQEBCwUA
+A4IBAQCY8jdaQZChGsV2USggNiMOruYou6r4lK5IpDB/G/wkjUu0yKGX9rbxenDI
+U5PMCCjjmCXPI6T53iHTfIUJrU6adTrCC2qJeHZERxhlbI1Bjjt/msv0tadQ1wUs
+N+gDS63pYaACbvXy8MWy7Vu33PqUXHeeE6V/Uq2V8viTO96LXFvKWlJbYK8U90vv
+o/ufQJVtMVT8QtPHRh8jrdkPSHCa2XV4cdFyQzR1bldZwgJcJmApzyMZFo6IQ6XU
+5MsI+yMRQ+hDKXJioaldXgjUkK642M4UwtBV8ob2xJNDd2ZhwLnoQdeXeGADbkpy
+rqXRfboQnoZsG4q5WTP468SQvvG5
+-----END CERTIFICATE-----
+)EOF";
+
+const char AWS_CLIENT_CERT[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDWTCCAkGgAwIBAgIUVvb58mF8QJx2G7Q7HYRBSaTYBKcwDQYJKoZIhvcNAQEL
+BQAwTTFLMEkGA1UECwxCQW1hem9uIFdlYiBTZXJ2aWNlcyBPPUFtYXpvbi5jb20g
+SW5jLiBMPVNlYXR0bGUgU1Q9V2FzaGluZ3RvbiBDPVVTMB4XDTI2MDEwNDEyMjAz
+MFoXDTQ5MTIzMTIzNTk1OVowHjEcMBoGA1UEAwwTQVdTIElvVCBDZXJ0aWZpY2F0
+ZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALhGpPA4wL2PFSNGWEPR
+ZRGUwr7W3ZbuuK7pGQdmm8Fnphq3SQzfhhfxrphvjIhiBq8nK1PR775hcc6uTXHn
+H0vbCWHAmMwPekxYgZr/hoYdkkOaJ6DL+6XCvLGLTMxnzJsYAqQTq3gCdktUt5/j
+GhVh9nHM0JLwZGgbgRk9zFbnKemgOONiAEhukoSXr28RVaQ23Bxo0i0IadHvMiUc
+ZybI6CFoKYYqULCFCaUVlrDVhaROzIzvBcAu7dOoWNOcE5rHSYt1ikB7Z0GN0nUF
+XOgLTkqGARRjz5fgCwmW12+c6TXRA1nCK0Ro6WyxH+oJltWyHwkvuPo23r31UhWt
+j08CAwEAAaNgMF4wHwYDVR0jBBgwFoAUXyIpOiGip5MdkIG0ICKHeDMh7CAwHQYD
+VR0OBBYEFIrVGTYGs5FWev9JM7DE+1DgnuJ2MAwGA1UdEwEB/wQCMAAwDgYDVR0P
+AQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4IBAQCDSQuc2ywlcgqvxVCm0Fwu1Z2H
+lKNHkWOtBXHgx+EtcH46MP/QQ7ZrSzR7RgDaEcU8QOyKy9KOIvmucraaSezPZyr0
+XQ5gKSJI98dOL8J9xaHW3OfzuqXufcIlcUxZjT4YHhyPA/+VEkIkbd6GcXFv879L
+hnyGGsv40e/CG6oAiIiHOHXKEFAsnKgH+WVCtswiG7jvlqTjUV4CxKO6HgBAu0t2
+hK9xdLs417IdXnYLmtXcQ04w08g0xxk9RchWgeJ5OCkyK4odUXoWwKmqTns14/YA
+Tous6Xv4DDDNOeArT0RLs3ypZz3LHYjBIs2US2aDbRX+RpK0dxlMn3IJNIbt
+-----END CERTIFICATE-----
+
+
+)EOF";
+
+const char AWS_PRIVATE_KEY[] PROGMEM = R"EOF(
+-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAuEak8DjAvY8VI0ZYQ9FlEZTCvtbdlu64rukZB2abwWemGrdJ
+DN+GF/GumG+MiGIGrycrU9HvvmFxzq5NcecfS9sJYcCYzA96TFiBmv+Ghh2SQ5on
+oMv7pcK8sYtMzGfMmxgCpBOreAJ2S1S3n+MaFWH2cczQkvBkaBuBGT3MVucp6aA4
+42IASG6ShJevbxFVpDbcHGjSLQhp0e8yJRxnJsjoIWgphipQsIUJpRWWsNWFpE7M
+jO8FwC7t06hY05wTmsdJi3WKQHtnQY3SdQVc6AtOSoYBFGPPl+ALCZbXb5zpNdED
+WcIrRGjpbLEf6gmW1bIfCS+4+jbevfVSFa2PTwIDAQABAoIBAG9xObqVd+qrp2rn
+1eVdszPItWXYZ7YptMMC8UIKidOTLV8mzSTd4SiF3sMNYv3v2n7+vzM32TdXkw4d
+V3S1A7ZKRwg5A68VBS86r1bfhamCJLyBc8nI0u1SMe9lgRJ1C8YX5TD5PE+dnZC9
+MTeejl20GuiDpvfWLcLQL2jmeLdsmrUINaHEz11zGjPs0jli5iqRU3hyiV1TGPz1
+MkANAH2f9poefKN+y/LpdbSVwkNFsE9WhwAfXk+tGReQ/OXkfmWcdO5UdcQjMc6X
+rmtvIs0LXD16Jg1oAJ8olhM8WZ+y1e/WxLoyIwh4hl6H5o0yeREZXSfdfRL0NUzK
+EvYdd2ECgYEA2bhDUVhE2WlEWaFSIKJjDu28xugBkSBlBgqzrgNWZ6AF7iw5ch8k
+Hom6PoBn4rbBNTWvbYEFWyV/oDczCD9O4aODOqr2Zn3jhYScK2jZ4SHD2IwTTXuf
+G327QwGGjQ2szeozcgFAu5tKa5RP46L3zwrrvHTRz8qO2Zt1xA3HjNcCgYEA2K0M
+e//g7srKN2VCziYoa7N4YJwVs+SgqXi6NcZlGGCCBa/bO+4tlkuZlYhOoexphnz4
+IUsX4ovVKVUi6BQKZ/03M3TJ4j+BjzsbPhsUkKl/EILxvf+v9OsMjUE8ohjKxn71
+9p5CIQlZgmlVThJh5b0/Lnj2knaiMTsmdacqCkkCgYEAz0dIf9djpQE9W3/kqsEv
+QfVA9rXHWB3ZUEk8C32N85Y8Tya3glj3kENbl0m0nfmUNE5qN/zP1pj6ytQCt+Vd
++iAsPdyqPaW4yVMZQ5LNbDMzO6UQc4IwVoH7mK2JJh1Q2bIRTIa41GPiFE3dSUHM
+X8dr673kSsnz+mSxV/gudX0CgYBhCgdoVW3ApFOyQYiM2OwLaCJGakESAxetLqN+
+x+6o3zf8Igk2qvIBuLP9E0HcJQwRrlBWYNI+pM9/pmBuveL3NaGOSwTLbhOxORB3
+XRt1umNs2qg3ppaAQvCpJoloM2BFS8EOhUwqjYxn6pLI11S+1mXAg24ypCz5jXsp
+AAfE+QKBgD8H/Fg+/BXkEEvcklESJuD+z1DlKBAkr/wgCZMZeSX9BuML0yVO74a5
+FFihFjiUOkAO/9g2CZDxgSW16nbIMkE/FQm9g3W03eR6FwGemYPp7zL473gCPAag
+RnVPEPORxbeeh14Twe4qmjJqht8dh1gehFfr7vTYww+rby10dTmg
+-----END RSA PRIVATE KEY-----
+
+
+)EOF";
+
+/* ================= OBJECT ================= */
+WiFiClientSecure net;
+PubSubClient mqtt(net);
+
+/* ================= ROBOT STATE ================= */
+enum MoveCmd { STOP, FORWARD, BACKWARD, LEFT, RIGHT };
+volatile MoveCmd currentCmd = STOP;
+
+volatile bool streamEncA = false;
+volatile bool streamEncB = false;
+const uint32_t ENC_PUB_MS = 200;
+
+// Non-blocking connection management
+unsigned long lastWiFiAttempt = 0;
+const unsigned long WIFI_RETRY_MS = 5000;
+bool timeConfigured = false;
+unsigned long lastMqttAttempt = 0;
+const unsigned long MQTT_RETRY_MS = 3000;
+bool wifiWasConnected = false;
+/* ================= INTERRUPTS ================= */
+void IRAM_ATTR encoderLeftISR() {
+  int a = digitalRead(ENCL_C1);
+  int b = digitalRead(ENCL_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderLeftCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR encoderRightISR() {
+  int a = digitalRead(ENCR_C1);
+  int b = digitalRead(ENCR_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderRightCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+/* ================= MOTOR ================= */
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, 0);
+  ledcWrite(ledChannelB, 0);
+}
+
+void motorsForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+}
+
+void motorsBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+}
+
+void motorsLeft() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void motorsRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void applyCommand(MoveCmd cmd) {
+  switch (cmd) {
+    case FORWARD: motorsForward(); break;
+    case BACKWARD: motorsBackward(); break;
+    case LEFT: motorsLeft(); break;
+    case RIGHT: motorsRight(); break;
+    default: motorsStop(); break;
+  }
+}
+
+/* ================= MQTT CALLBACK ================= */
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (uint32_t i = 0; i < length; i++) msg += (char)payload[i];
+
+  /* LED */
+  if (String(topic) == TOPIC_LED_CMD) {
+    if (msg == "ON") {
+      digitalWrite(LED_PIN, HIGH);
+      mqtt.publish(TOPIC_LED_STATUS, "ON");
+    } else if (msg == "OFF") {
+      digitalWrite(LED_PIN, LOW);
+      mqtt.publish(TOPIC_LED_STATUS, "OFF");
+    }
+    return;
+  }
+
+  /* Robot */
+  if (msg == "ENA") streamEncA = true;
+  else if (msg == "ENAS") streamEncA = false;
+  else if (msg == "ENB") streamEncB = true;
+  else if (msg == "ENBS") streamEncB = false;
+  else {
+    char c = msg[0];
+    if (c == 'H') currentCmd = FORWARD;
+    else if (c == 'B') currentCmd = BACKWARD;
+    else if (c == 'L') currentCmd = LEFT;
+    else if (c == 'R') currentCmd = RIGHT;
+    else currentCmd = STOP;
+    applyCommand(currentCmd);
+  }
+}
+
+/* ================= AWS CONNECT ================= */
+void connectAWS() {
+  if (mqtt.connected()) return;
+  if (millis() - lastMqttAttempt < MQTT_RETRY_MS) return;
+  lastMqttAttempt = millis();
+  if (mqtt.connect(CLIENT_ID)) {
+    mqtt.subscribe(TOPIC_CMD);
+    mqtt.subscribe(TOPIC_LED_CMD);
+    mqtt.publish(TOPIC_STATUS, "ONLINE", true);
+  }
+}
+
+/* ================= ENCODER TASK ================= */
+void encoderTask() {
+  static uint32_t t = 0;
+  if (millis() - t < ENC_PUB_MS) return;
+  t = millis();
+
+  long dL, dR;
+  portENTER_CRITICAL(&mux);
+  dL = encoderLeftCount; encoderLeftCount = 0;
+  dR = encoderRightCount; encoderRightCount = 0;
+  portEXIT_CRITICAL(&mux);
+
+  float rpmL = (dL / PPR_EFF) * 600.0;
+  float rpmR = (dR / PPR_EFF) * 600.0;
+
+  if (streamEncA) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"d\":%ld,\"rpm\":%.2f}", dL, rpmL);
+    mqtt.publish(TOPIC_ENC_A, buf);
+  }
+
+  if (streamEncB) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"d\":%ld,\"rpm\":%.2f}", dR, rpmR);
+    mqtt.publish(TOPIC_ENC_B, buf);
+  }
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(ENCL_C1, INPUT_PULLUP);
+  pinMode(ENCL_C2, INPUT_PULLUP);
+  pinMode(ENCR_C1, INPUT_PULLUP);
+  pinMode(ENCR_C2, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENCL_C1), encoderLeftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCR_C1), encoderRightISR, CHANGE);
+
+  ledcSetup(ledChannelA, freq, resolution);
+  ledcAttachPin(ENA_PIN, ledChannelA);
+  ledcSetup(ledChannelB, freq, resolution);
+  ledcAttachPin(ENB_PIN, ledChannelB);
+
+  // Configure WiFi in station mode and start connecting (non-blocking)
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setHostname("esp32_robot");
+  Serial.println("WiFi: start connecting...");
+  WiFi.begin(ssid, password);
+
+  // show immediate status
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("WiFi connected, IP="); Serial.println(WiFi.localIP());
+  } else {
+    Serial.print("WiFi status: "); Serial.println(WiFi.status());
+  }
+
+  net.setCACert(AWS_ROOT_CA);
+  net.setCertificate(AWS_CLIENT_CERT);
+  net.setPrivateKey(AWS_PRIVATE_KEY);
+
+  mqtt.setServer(AWS_ENDPOINT, AWS_PORT);
+  mqtt.setCallback(mqttCallback);
+
+  // try connecting to AWS once (non-blocking retries happen in loop)
+  connectAWS();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  // WiFi: start reconnect attempts at intervals (non-blocking)
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWiFiAttempt > WIFI_RETRY_MS) {
+      lastWiFiAttempt = millis();
+      Serial.println("WiFi: retrying connect...");
+      WiFi.begin(ssid, password);
+    }
+    wifiWasConnected = false;
+  } else {
+    if (!wifiWasConnected) {
+      Serial.print("WiFi connected, IP="); Serial.println(WiFi.localIP());
+      wifiWasConnected = true;
+    }
+    if (!timeConfigured) {
+      configTime(7 * 3600, 0, "pool.ntp.org");
+      timeConfigured = true;
+    }
+  }
+
+  // MQTT: attempt non-blocking connect when possible
+  if (!mqtt.connected()) connectAWS();
+  mqtt.loop();
+
+  encoderTask();
+}

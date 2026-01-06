@@ -1,0 +1,391 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+// ================== L298N ==================
+const int IN1 = 26;
+const int IN2 = 27;
+const int ENA_PIN = 25;
+
+const int IN3 = 12;
+const int IN4 = 13;
+const int ENB_PIN = 14;
+
+// ================== ENCODER LEFT (A) ==================
+#define ENCL_C1 35
+#define ENCL_C2 34
+
+// ================== ENCODER RIGHT (B) ==================
+#define ENCR_C1 32
+#define ENCR_C2 33
+
+// ================== PWM ==================
+const int freq = 5000;
+const int ledChannelA = 0;
+const int ledChannelB = 1;
+const int resolution = 8; // 0..255
+
+// ====== Encoder counts ======
+volatile long encoderLeftCount = 0;
+volatile long encoderRightCount = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ====== PPR hiệu dụng ======
+const float PPR_EFF = 40.0f;
+
+// ====== Latest encoder values (cập nhật mỗi 100ms) ======
+volatile long lastDL = 0, lastDR = 0;
+volatile float lastRpmL = 0.0f, lastRpmR = 0.0f;
+
+// ================== WiFi config ==================
+const char* WIFI_SSID     = "VanDatVjpPro";
+const char* WIFI_PASSWORD = "1502:333";
+
+// ================== MQTT (HiveMQ Cloud) config ==================
+const char* mqtt_server    = "43bada278be7468bb212609d24e98ec7.s1.eu.hivemq.cloud";
+const int   mqtt_port      = 8883;
+const char* mqtt_user      = "VanDat";
+const char* mqtt_pass      = "RobotCar1";
+const char* mqtt_client_id = "esp32_iot_xe";
+const char* mqtt_topic_sub = "iot/esp32/cmd";
+const char* mqtt_topic_pub = "iot/esp32/status";
+
+// encoder topics
+const char* mqtt_topic_encA = "iot/esp32/encA";
+const char* mqtt_topic_encB = "iot/esp32/encB";
+
+// ===== MQTT objects =====
+WiFiClientSecure secureClient;
+PubSubClient mqtt(secureClient);
+
+// ===== Robot control =====
+uint8_t speedA = 255;
+uint8_t speedB = 255;
+
+enum MoveCmd { STOP, FORWARD, BACKWARD, LEFT, RIGHT };
+volatile MoveCmd currentCmd = STOP;
+
+// ===== Encoder streaming flags =====
+volatile bool streamEncA = false;
+volatile bool streamEncB = false;
+
+// ===== Publish interval for encoder (ms) =====
+const uint32_t ENC_PUB_MS = 200;
+
+// ---------- Forward declarations ----------
+void publishStatus(const char* msg);
+void publishEncoderA();
+void publishEncoderB();
+
+// ================== INTERRUPT ==================
+void IRAM_ATTR encoderLeftISR() {
+  int a = digitalRead(ENCL_C1);
+  int b = digitalRead(ENCL_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderLeftCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR encoderRightISR() {
+  int a = digitalRead(ENCR_C1);
+  int b = digitalRead(ENCR_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderRightCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+// ===== Status helper =====
+void publishStatus(const char* msg) {
+  Serial.println(msg);
+  if (mqtt.connected()) mqtt.publish(mqtt_topic_pub, msg, true);
+}
+
+// ===== Motor control =====
+void motorsStop() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, 0);
+  ledcWrite(ledChannelB, 0);
+  publishStatus("Motors STOP");
+}
+void motorsForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors FORWARD");
+}
+void motorsBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors BACKWARD");
+}
+void motorsLeft() { // trái lùi, phải tiến
+  digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors LEFT");
+}
+void motorsRight() { // trái tiến, phải lùi
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  ledcWrite(ledChannelA, speedA);
+  ledcWrite(ledChannelB, speedB);
+  publishStatus("Motors RIGHT");
+}
+
+void applyCommand(MoveCmd cmd) {
+  switch (cmd) {
+    case FORWARD:  motorsForward();  break;
+    case BACKWARD: motorsBackward(); break;
+    case LEFT:     motorsLeft();     break;
+    case RIGHT:    motorsRight();    break;
+    default:       motorsStop();     break;
+  }
+}
+
+// ===== WiFi helper =====
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  Serial.print("Connecting WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - t0 > 20000) {
+      Serial.println("\nWiFi timeout -> retry");
+      WiFi.disconnect(true);
+      delay(500);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      t0 = millis();
+    }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ===== Encoder publish helpers =====
+void publishEncoderA() {
+  char msg[128];
+  long dl; float rpm;
+  portENTER_CRITICAL(&mux);
+  dl = lastDL; rpm = lastRpmL;
+  portEXIT_CRITICAL(&mux);
+
+  snprintf(msg, sizeof(msg),
+           "{\"enc\":\"A\",\"d\":%ld,\"rpm\":%.2f}", dl, rpm);
+
+  if (mqtt.connected()) mqtt.publish(mqtt_topic_encA, msg, false);
+}
+
+void publishEncoderB() {
+  char msg[128];
+  long dr; float rpm;
+  portENTER_CRITICAL(&mux);
+  dr = lastDR; rpm = lastRpmR;
+  portEXIT_CRITICAL(&mux);
+
+  snprintf(msg, sizeof(msg),
+           "{\"enc\":\"B\",\"d\":%ld,\"rpm\":%.2f}", dr, rpm);
+
+  if (mqtt.connected()) mqtt.publish(mqtt_topic_encB, msg, false);
+}
+
+// ===== MQTT helpers =====
+static inline void toUpperInPlace(char* s) {
+  for (; *s; ++s) *s = (char)toupper((unsigned char)*s);
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  if (length == 0) return;
+
+  static char buf[64];
+  unsigned int n = (length < sizeof(buf) - 1) ? length : (sizeof(buf) - 1);
+  memcpy(buf, payload, n);
+  buf[n] = '\0';
+
+  while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r' || buf[n-1] == ' ' || buf[n-1] == '\t')) {
+    buf[n-1] = '\0';
+    n--;
+  }
+  toUpperInPlace(buf);
+
+  Serial.print("MQTT IN [");
+  Serial.print(topic);
+  Serial.print("] : ");
+  Serial.println(buf);
+
+  // ---- encoder stream control ----
+  if (strcmp(buf, "ENA") == 0) {
+    streamEncA = true;
+    publishStatus("ENC A STREAM ON");
+    return;
+  }
+  if (strcmp(buf, "ENAS") == 0) {
+    streamEncA = false;
+    publishStatus("ENC A STREAM OFF");
+    return;
+  }
+  if (strcmp(buf, "ENB") == 0) {
+    streamEncB = true;
+    publishStatus("ENC B STREAM ON");
+    return;
+  }
+  if (strcmp(buf, "ENBS") == 0) {
+    streamEncB = false;
+    publishStatus("ENC B STREAM OFF");
+    return;
+  }
+
+  // ---- movement commands (H/B/L/R/S) ----
+  MoveCmd next = STOP;
+  char c = buf[0];
+
+  if (c == 'H') next = FORWARD;
+  else if (c == 'B') next = BACKWARD;
+  else if (c == 'L') next = LEFT;
+  else if (c == 'R') next = RIGHT;
+  else if (c == 'S') next = STOP;
+  else {
+    publishStatus("Unknown CMD (H/B/L/R/S, ENA/ENAS, ENB/ENBS)");
+    return;
+  }
+
+  currentCmd = next;
+  applyCommand(currentCmd);
+}
+
+void connectMQTT() {
+  while (!mqtt.connected()) {
+    Serial.print("Connecting MQTT...");
+
+    const char* willTopic = mqtt_topic_pub;
+    const char* willMsg   = "offline";
+
+    bool ok = mqtt.connect(
+      mqtt_client_id,
+      mqtt_user,
+      mqtt_pass,
+      willTopic, 0, true, willMsg
+    );
+
+    if (ok) {
+      Serial.println("OK");
+      mqtt.publish(mqtt_topic_pub, "online", true);
+
+      if (mqtt.subscribe(mqtt_topic_sub)) {
+        Serial.print("Subscribed: ");
+        Serial.println(mqtt_topic_sub);
+      } else {
+        Serial.println("Subscribe FAIL");
+      }
+    } else {
+      Serial.print("FAILED, state=");
+      Serial.print(mqtt.state());
+      Serial.println(" -> retry in 2s");
+      delay(2000);
+    }
+  }
+}
+
+// ===== Encoder compute task (mỗi 100ms) =====
+void updateEncoderEvery100ms() {
+  static uint32_t t0 = 0;
+  const uint32_t dt_ms = 100;
+
+  if (millis() - t0 < dt_ms) return;
+  t0 += dt_ms;
+
+  long dL, dR;
+  portENTER_CRITICAL(&mux);
+  dL = encoderLeftCount;  encoderLeftCount = 0;
+  dR = encoderRightCount; encoderRightCount = 0;
+  portEXIT_CRITICAL(&mux);
+
+  float dt_s = dt_ms / 1000.0f;
+  float rpmL = ((float)dL / PPR_EFF) * (60.0f / dt_s);
+  float rpmR = ((float)dR / PPR_EFF) * (60.0f / dt_s);
+
+  portENTER_CRITICAL(&mux);
+  lastDL = dL;  lastDR = dR;
+  lastRpmL = rpmL; lastRpmR = rpmR;
+  portEXIT_CRITICAL(&mux);
+}
+
+// ===== Encoder publish task (mỗi ENC_PUB_MS nếu stream ON) =====
+void streamEncoderIfEnabled() {
+  static uint32_t tPubA = 0, tPubB = 0;
+  uint32_t now = millis();
+
+  if (streamEncA && (now - tPubA >= ENC_PUB_MS)) {
+    tPubA = now;
+    publishEncoderA();
+  }
+  if (streamEncB && (now - tPubB >= ENC_PUB_MS)) {
+    tPubB = now;
+    publishEncoderB();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+
+  // Motor pins
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // Encoder pins
+  pinMode(ENCL_C1, INPUT_PULLUP);
+  pinMode(ENCL_C2, INPUT_PULLUP);
+  pinMode(ENCR_C1, INPUT_PULLUP);
+  pinMode(ENCR_C2, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENCL_C1), encoderLeftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCR_C1), encoderRightISR, CHANGE);
+
+  // PWM
+  ledcSetup(ledChannelA, freq, resolution);
+  ledcAttachPin(ENA_PIN, ledChannelA);
+
+  ledcSetup(ledChannelB, freq, resolution);
+  ledcAttachPin(ENB_PIN, ledChannelB);
+
+  motorsStop();
+
+  connectWiFi();
+
+  // TLS demo mode
+  secureClient.setInsecure();
+  secureClient.setHandshakeTimeout(30);
+
+  mqtt.setServer(mqtt_server, mqtt_port);
+  mqtt.setCallback(onMqttMessage);
+
+  connectMQTT();
+
+  Serial.println("RobotCar MQTT + Encoder stream ready!");
+  Serial.println("Move: H/B/L/R/S");
+  Serial.println("Encoder stream: ENA / ENAS, ENB / ENBS");
+}
+
+void loop() {
+  connectWiFi();
+  if (!mqtt.connected()) connectMQTT();
+  mqtt.loop();
+
+  updateEncoderEvery100ms();
+  streamEncoderIfEnabled();
+}

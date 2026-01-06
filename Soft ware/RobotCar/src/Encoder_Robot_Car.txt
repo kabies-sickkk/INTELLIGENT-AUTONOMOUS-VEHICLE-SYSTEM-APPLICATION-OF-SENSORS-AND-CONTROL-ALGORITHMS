@@ -1,0 +1,112 @@
+#include <Arduino.h>
+
+// ================== L298N ==================
+#define IN1 26
+#define IN2 27
+#define ENA 25
+
+#define IN3 12
+#define IN4 13
+#define ENB 14
+
+// ================== ENCODER LEFT ==================
+#define ENCL_C1 35
+#define ENCL_C2 34
+
+// ================== ENCODER RIGHT ==================
+#define ENCR_C1 32
+#define ENCR_C2 33
+
+// ================== PWM ==================
+#define PWM_CHANNEL_A 0
+#define PWM_CHANNEL_B 1
+#define PWM_FREQ 1000
+#define PWM_RESOLUTION 8  // 0–255
+
+// ====== Encoder counts ======
+volatile long encoderLeftCount = 0;
+volatile long encoderRightCount = 0;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ====== PPR hiệu dụng ======
+// Sửa theo encoder của bạn!
+// Ví dụ encoder ghi 20 PPR (1 kênh), bạn bắt CHANGE => PPR_EFF = 40
+const float PPR_EFF = 40.0f;
+
+// ================== INTERRUPT ==================
+void IRAM_ATTR encoderLeftISR() {
+  int a = digitalRead(ENCL_C1);
+  int b = digitalRead(ENCL_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderLeftCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR encoderRightISR() {
+  int a = digitalRead(ENCR_C1);
+  int b = digitalRead(ENCR_C2);
+  portENTER_CRITICAL_ISR(&mux);
+  encoderRightCount += (a == b) ? 1 : -1;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // ---------- Motor ----------
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // ---------- Encoder ----------
+  // 34/35 là input-only, OK. Nên dùng pullup để ổn định nếu encoder open-collector.
+  pinMode(ENCL_C1, INPUT_PULLUP);
+  pinMode(ENCL_C2, INPUT_PULLUP);
+  pinMode(ENCR_C1, INPUT_PULLUP);
+  pinMode(ENCR_C2, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENCL_C1), encoderLeftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCR_C1), encoderRightISR, CHANGE);
+
+  // ---------- PWM ----------
+  ledcSetup(PWM_CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENA, PWM_CHANNEL_A);
+
+  ledcSetup(PWM_CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENB, PWM_CHANNEL_B);
+
+  Serial.println("ESP32 + L298N + Dual Encoder -> RPM");
+}
+
+void loop() {
+  // ======== FORWARD (chạy thẳng) ========
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+
+  ledcWrite(PWM_CHANNEL_A, 150);
+  ledcWrite(PWM_CHANNEL_B, 150);
+
+  // ======== Tính RPM mỗi 100ms ========
+  static uint32_t t0 = millis();
+  const uint32_t dt_ms = 100;
+
+  if (millis() - t0 >= dt_ms) {
+    t0 += dt_ms;
+
+    long dL, dR;
+    portENTER_CRITICAL(&mux);
+    dL = encoderLeftCount;  encoderLeftCount = 0;
+    dR = encoderRightCount; encoderRightCount = 0;
+    portEXIT_CRITICAL(&mux);
+
+    float dt_s = dt_ms / 1000.0f;
+    float rpmL = ((float)dL / PPR_EFF) * (60.0f / dt_s);
+    float rpmR = ((float)dR / PPR_EFF) * (60.0f / dt_s);
+
+    Serial.print("dL="); Serial.print(dL);
+    Serial.print(" rpmL="); Serial.print(rpmL, 1);
+    Serial.print(" | dR="); Serial.print(dR);
+    Serial.print(" rpmR="); Serial.println(rpmR, 1);
+  }
+}

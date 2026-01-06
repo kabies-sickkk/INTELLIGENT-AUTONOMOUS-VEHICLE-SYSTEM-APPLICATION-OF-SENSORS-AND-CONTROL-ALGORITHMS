@@ -1,0 +1,112 @@
+#include <Arduino.h>
+
+// ================== L298N ==================
+#define IN1 26
+#define IN2 27
+#define ENA 25
+#define IN3 12
+#define IN4 13
+#define ENB 14
+
+// ================== ENCODER LEFT ==================
+#define ENCL_C1 35
+#define ENCL_C2 34
+
+// ================== ENCODER RIGHT ==================
+#define ENCR_C1 32
+#define ENCR_C2 33
+
+// ================== PWM ==================
+#define PWM_CHANNEL_A 0
+#define PWM_CHANNEL_B 1
+#define PWM_FREQ 1000
+#define PWM_RESOLUTION 8
+
+// ================== SPEED SAMPLE ==================
+const uint32_t SPEED_SAMPLE_MS = 100;
+
+// encoder counts (ISR changes these)
+volatile long encoderLeftCount = 0;
+volatile long encoderRightCount = 0;
+
+// for safe reading of ISR vars
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+// ================== INTERRUPT ==================
+void IRAM_ATTR encoderLeftISR() {
+  if (digitalRead(ENCL_C1) == digitalRead(ENCL_C2))
+    encoderLeftCount++;
+  else
+    encoderLeftCount--;
+}
+
+void IRAM_ATTR encoderRightISR() {
+  if (digitalRead(ENCR_C1) == digitalRead(ENCR_C2))
+    encoderRightCount++;
+  else
+    encoderRightCount--;
+}
+
+// speed state
+long lastLeftCount = 0;
+long lastRightCount = 0;
+uint32_t lastSpeedMillis = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor pins
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // Encoder pins
+  pinMode(ENCL_C1, INPUT);
+  pinMode(ENCL_C2, INPUT);
+  pinMode(ENCR_C1, INPUT);
+  pinMode(ENCR_C2, INPUT);
+
+  attachInterrupt(digitalPinToInterrupt(ENCL_C1), encoderLeftISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCR_C1), encoderRightISR, CHANGE);
+
+  // PWM
+  ledcSetup(PWM_CHANNEL_A, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENA, PWM_CHANNEL_A);
+  ledcSetup(PWM_CHANNEL_B, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttachPin(ENB, PWM_CHANNEL_B);
+
+  // Run forward
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  ledcWrite(PWM_CHANNEL_A, 250);
+  ledcWrite(PWM_CHANNEL_B, 250);
+
+  lastSpeedMillis = millis();
+  Serial.println("ppsL ppsR");
+}
+
+void loop() {
+  uint32_t now = millis();
+  if (now - lastSpeedMillis >= SPEED_SAMPLE_MS) {
+    float dt = (now - lastSpeedMillis) / 1000.0f;
+    lastSpeedMillis = now;
+
+    long curL, curR;
+    portENTER_CRITICAL(&mux);
+    curL = encoderLeftCount;
+    curR = encoderRightCount;
+    portEXIT_CRITICAL(&mux);
+
+    long dL = curL - lastLeftCount;
+    long dR = curR - lastRightCount;
+
+    lastLeftCount = curL;
+    lastRightCount = curR;
+
+    float ppsL = dL / dt;
+    float ppsR = dR / dt;
+
+    Serial.print(ppsL, 1);
+    Serial.print(" ");
+    Serial.println(ppsR, 1);
+  }
+}
